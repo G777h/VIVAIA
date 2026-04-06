@@ -28,14 +28,26 @@ def process_data(inventory_file, products_file, sales_file):
     sales_df = load_csv(sales_file)
 
     # 库存负数清洗
-    inventory_df['On hand (current)'] = pd.to_numeric(inventory_df['On hand (current)'], errors='coerce').fillna(0)
-    inventory_df['On hand (current)'] = inventory_df['On hand (current)'].clip(lower=0)
+    # 【新增逻辑】：判断库存表属于哪种格式，并分别进行负数清洗
+    has_location_col = 'Location' in inventory_df.columns
+
+    if has_location_col:
+        # 格式1：旧表格（含有 Location 和 On hand (current) 列）
+        inventory_df['On hand (current)'] = pd.to_numeric(inventory_df['On hand (current)'], errors='coerce').fillna(0)
+        inventory_df['On hand (current)'] = inventory_df['On hand (current)'].clip(lower=0)
+    else:
+        # 格式2：新表格（无 Location 列，库存分别在各门店名称列中）
+        store_cols = ['VIVAIA MELBOURNE CENTRAL', 'VIVAIA QVB', 'VIVAIA BONDI JUNCTION']
+        for col in store_cols:
+            if col in inventory_df.columns:
+                inventory_df[col] = pd.to_numeric(inventory_df[col], errors='coerce').fillna(0)
+                inventory_df[col] = inventory_df[col].clip(lower=0)
 
     inventory_df['SKC'] = inventory_df['SKU'].astype(str).str[:-3]
     products_df['SKC'] = products_df['Handle'].astype(str).str[:-3]
     sales_df['SKC'] = sales_df['Lineitem sku'].astype(str).str[:-3]
 
-    products_unique = products_df.drop_duplicates(subset=['SKC'], keep='first')[['SKC', 'Image Src']]
+    products_unique = products_df.drop_duplicates(subset=['SKC'], keep='first')[['SKC', 'Image Src', 'Variant Compare At Price']]
 
     # 销售表预处理
     sales_df['Lineitem quantity'] = pd.to_numeric(sales_df['Lineitem quantity'], errors='coerce').fillna(0)
@@ -58,16 +70,52 @@ def process_data(inventory_file, products_file, sales_file):
     generated_files = {}
 
     for file_prefix, loc_name in target_locations.items():
-        loc_inv = inventory_df[inventory_df['Location'] == loc_name].copy()
+
+        # 【新增逻辑】：根据不同格式提取当前门店库存，并统一标准列名
+        if has_location_col:
+            # 格式1处理方式
+            loc_inv = inventory_df[inventory_df['Location'] == loc_name].copy()
+        else:
+            # 格式2处理方式：拷贝全表，提取该店专属列
+            loc_inv = inventory_df.copy()
+            if loc_name in loc_inv.columns:
+                # 巧妙转换：将该店的库存列强行重命名为 'On hand (current)'
+                # 这样后续的所有统计、分组代码完全不需要修改即可生效
+                loc_inv['On hand (current)'] = loc_inv[loc_name]
+            else:
+                loc_inv = pd.DataFrame()  # 如果表里没这家店的列，制造空表触发下方警告
+
         if loc_inv.empty:
             continue
 
         split_title = loc_inv['Title'].astype(str).str.split('/', expand=True)
         loc_inv['Category'] = split_title[0] if 0 in split_title.columns else ''
         loc_inv['Collection'] = split_title[1] if 1 in split_title.columns else ''
-        loc_inv['color'] = split_title[3] if 3 in split_title.columns else ''
-        loc_inv['Size'] = split_title[4] if 4 in split_title.columns else ''
-        loc_inv['Size'] = loc_inv['Size'].str.strip()
+
+        # 初始化为空字符串
+        loc_inv['color'] = ''
+        loc_inv['Size'] = ''
+
+        # 动态判断整张表中是否出现了被分割成 6 个部分的数据（索引为 5）
+        if 5 in split_title.columns:
+            # 制作一个掩码(Mask)：判断当前行是否有第 6 个数据
+            has_6_parts = split_title[5].notna() & (split_title[5] != '')
+
+            # 1. 针对有 6 个数据的行：颜色为第4+第5个（带/符号），尺码为第6个
+            loc_inv.loc[has_6_parts, 'color'] = split_title.loc[has_6_parts, 3].astype(str) + '/' + split_title.loc[
+                has_6_parts, 4].astype(str)
+            loc_inv.loc[has_6_parts, 'Size'] = split_title.loc[has_6_parts, 5]
+
+            # 2. 针对只有 5 个数据的行：按老规矩处理
+            loc_inv.loc[~has_6_parts, 'color'] = split_title.loc[~has_6_parts, 3] if 3 in split_title.columns else ''
+            loc_inv.loc[~has_6_parts, 'Size'] = split_title.loc[~has_6_parts, 4] if 4 in split_title.columns else ''
+        else:
+            # 如果表中所有行都非常规整，最多只有 5 个数据
+            loc_inv['color'] = split_title[3] if 3 in split_title.columns else ''
+            loc_inv['Size'] = split_title[4] if 4 in split_title.columns else ''
+
+        # 清理提取出来的尺码字符串两端的空格
+        loc_inv['Size'] = loc_inv['Size'].astype(str).str.strip()
 
         # 1. 计算总库存
         grouped_inv = loc_inv.groupby('SKC').agg({
@@ -112,8 +160,7 @@ def process_data(inventory_file, products_file, sales_file):
             'Collection': merged['Collection'],
             'SKC': merged['SKC'],
             'color': merged['color'],
-            'E列_留空': '',
-            'F列_留空': '',
+            'Price': merged['Variant Compare At Price'],
             'Pic': '',
             '30 Days Sales': merged['30_days'],
             '60 Days Sales': merged['60_days'],
